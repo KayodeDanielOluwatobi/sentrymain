@@ -1,8 +1,4 @@
-#include <BLEDevice.h>
-#include <BLEClient.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -175,21 +171,21 @@ String currentMode = "AUTO"; // "AUTO" or "MANUAL"
 // ============================================================
 
 // BMS Client UUIDs
-static BLEAddress bmsAddress("a4:c1:38:06:91:dc");
-static BLEUUID serviceUUID("0000ffe0-0000-1000-8000-00805f9b34fb");
-static BLEUUID dataCharUUID("0000ffe1-0000-1000-8000-00805f9b34fb");
-static BLEUUID writeCharUUID("0000ffe2-0000-1000-8000-00805f9b34fb");
+static NimBLEAddress bmsAddress("a4:c1:38:06:91:dc", BLE_ADDR_PUBLIC);
+static NimBLEUUID serviceUUID("0000ffe0-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID dataCharUUID("0000ffe1-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID writeCharUUID("0000ffe2-0000-1000-8000-00805f9b34fb");
 
-BLEClient* pClient = nullptr;
-BLERemoteCharacteristic* pDataChar  = nullptr;  // FFE1 — notify/read telemetry
-BLERemoteCharacteristic* pWriteChar = nullptr;  // FFE2 — write MOSFET control
+NimBLEClient* pClient = nullptr;
+NimBLERemoteCharacteristic* pDataChar  = nullptr;  // FFE1 — notify/read telemetry
+NimBLERemoteCharacteristic* pWriteChar = nullptr;  // FFE2 — write MOSFET control
 
 // Sentry Local Offline Control Service (BLE Server for Phone)
 #define SENTRY_SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define SENTRY_CTRL_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-BLEServer* pServer = nullptr;
-BLECharacteristic* pCtrlChar = nullptr;
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pCtrlChar = nullptr;
 bool blePhoneConnected = false;
 
 uint8_t frameBuffer[320];
@@ -309,22 +305,23 @@ void evaluateLoadShedding(float soc) {
 // ============================================================
 // BLE SERVER CALLBACKS (Phone / Offline Web Bluetooth Interface)
 // ============================================================
-class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
+class MyServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
         blePhoneConnected = true;
         Serial.println("[BLE SERVER] Phone connected directly via Bluetooth!");
         sendBLEStateNotify();
     }
-    void onDisconnect(BLEServer* pServer) {
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         blePhoneConnected = false;
         Serial.println("[BLE SERVER] Phone disconnected.");
-        BLEDevice::startAdvertising(); // Resume advertising for reconnects
+        NimBLEDevice::startAdvertising(); // Resume advertising for reconnects
     }
 };
 
-class ControlCallback : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        String rxValue = pCharacteristic->getValue().c_str();
+class ControlCallback : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo& connInfo) override {
+        std::string value = pCharacteristic->getValue();
+        String rxValue = value.c_str();
         if (rxValue.length() > 0) {
             Serial.print("[BLE SERVER RX]: ");
             Serial.println(rxValue);
@@ -611,8 +608,19 @@ void sendOverUART() {
 // ============================================================
 // BLE NOTIFY CALLBACK FOR BMS CLIENT
 // ============================================================
-static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+static void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
     if (length == 4 && pData[0] == 0x41 && pData[1] == 0x54) return;
+
+    if (length >= 5 && pData[0] == 0x55 && pData[1] == 0xAA &&
+        pData[2] == 0xEB && pData[3] == 0x90 && pData[4] == 0xC8) {
+        Serial.print("[BLE RX] MOSFET command response: ");
+        for (size_t i = 0; i < length; i++) {
+            if (pData[i] < 0x10) Serial.print("0");
+            Serial.print(pData[i], HEX);
+            Serial.print(i + 1 == length ? "\n" : " ");
+        }
+        return;
+    }
 
     if (length >= 4 && pData[0] == 0x55 && pData[1] == 0xAA && pData[2] == 0xEB && pData[3] == 0x90) {
         frameLen = 0;
@@ -648,22 +656,24 @@ void sendCommand(uint8_t cmd) {
 }
 
 void writeBLEFrame(uint8_t* frame, size_t len) {
-    bool success = false;
-    if (pDataChar) {
-        try {
-            pDataChar->writeValue(frame, len, false);
-            success = true;
-        } catch (...) {}
+    if (!bmsConnected || !pClient || !pClient->isConnected()) {
+        Serial.println("[BMS WRITE] FAILED: BMS is not connected.");
+        return;
     }
-    if (!success && pWriteChar) {
-        try {
-            pWriteChar->writeValue(frame, len, false);
-            success = true;
-        } catch (...) {}
+
+    if (!pDataChar || !pDataChar->canWriteNoResponse()) {
+        Serial.println("[BMS WRITE] FAILED: FFE1 no-response write is unavailable.");
+        return;
     }
-    if (!success) {
-        Serial.println("[!] writeBLEFrame FAILED — no valid characteristic or BMS not connected");
+
+    Serial.printf("[BMS WRITE] Sending %u bytes to FFE1 (without response): ", (unsigned)len);
+    for (size_t i = 0; i < len; i++) {
+        if (frame[i] < 0x10) Serial.print("0");
+        Serial.print(frame[i], HEX);
+        Serial.print(i + 1 == len ? "\n" : " ");
     }
+    pDataChar->writeValue(frame, len, false);
+    Serial.println("[BMS WRITE] Frame sent.");
 }
 
 // ============================================================
@@ -729,19 +739,28 @@ void unlockBMS() {
 }
 
 // ============================================================
-// Discharge / Charge MOSFET Control (password-gated)
+// Discharge / Charge MOSFET Control
 // ============================================================
 void setDischarge(bool enable) {
-    unlockBMS();
+    if (!bmsConnected || !pClient || !pClient->isConnected()) {
+        Serial.println("[CMD] Discharge command aborted: BMS is not connected.");
+        return;
+    }
 
-    uint8_t frame[20] = {
-        0xAA, 0x55, 0x90, 0xEB,
-        0x1E, 0x04, (uint8_t)(enable ? 0x01 : 0x00),
-        0,0,0,0,0,0,0,0,0,0,0,0
+    const uint8_t frame[20] = {
+        0xAA, 0x55, 0x90, 0xEB, 0x1E, 0x04,
+        (uint8_t)(enable ? 0x01 : 0x00), 0x00, 0x00, 0x00,
+        enable ? 0x20 : 0xDB,
+        enable ? 0xD1 : 0xF1,
+        enable ? 0xE1 : 0x0C,
+        enable ? 0x57 : 0xB7,
+        enable ? 0x54 : 0x1B,
+        enable ? 0x6C : 0xA1,
+        enable ? 0x08 : 0xD5,
+        enable ? 0xC0 : 0x6B,
+        enable ? 0x76 : 0x98,
+        enable ? 0xC4 : 0xBF
     };
-    uint16_t sum = 0;
-    for (int i = 0; i < 19; i++) sum += frame[i];
-    frame[19] = sum & 0xFF;
 
     Serial.print("[CMD] setDischarge(");
     Serial.print(enable ? "ON" : "OFF");
@@ -752,7 +771,7 @@ void setDischarge(bool enable) {
     }
     Serial.println();
 
-    writeBLEFrame(frame, sizeof(frame));
+    writeBLEFrame((uint8_t*)frame, sizeof(frame));
 }
 
 void setCharge(bool enable) {
@@ -813,28 +832,26 @@ void handleUARTCommand(const String& line) {
 // BLE Initialization (Server for Phone + Client for BMS)
 // ============================================================
 void setupBLEServer() {
-    pServer = BLEDevice::createServer();
+    pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
-    BLEService* pControlService = pServer->createService(SENTRY_SERVICE_UUID);
+    NimBLEService* pControlService = pServer->createService(SENTRY_SERVICE_UUID);
 
     pCtrlChar = pControlService->createCharacteristic(
         SENTRY_CTRL_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ |
-        BLECharacteristic::PROPERTY_WRITE |
-        BLECharacteristic::PROPERTY_NOTIFY
+        NIMBLE_PROPERTY::READ |
+        NIMBLE_PROPERTY::WRITE |
+        NIMBLE_PROPERTY::NOTIFY
     );
     pCtrlChar->setCallbacks(new ControlCallback());
-    pCtrlChar->addDescriptor(new BLE2902());
 
     pControlService->start();
 
-    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SENTRY_SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
-    pAdvertising->setMinPreferred(0x12);
-    BLEDevice::startAdvertising();
+    pAdvertising->setName("Sentry_Controller");
+    pAdvertising->enableScanResponse(true);
+    pAdvertising->start();
     Serial.println("[BLE SERVER] Sentry Offline Control Service Advertising!");
 }
 
@@ -845,25 +862,25 @@ bool connectBLE() {
     tftLog("Connecting to BMS...");
 
     if (!pClient) {
-        pClient = BLEDevice::createClient();
+        pClient = NimBLEDevice::createClient();
     }
 
     if (!pClient->connect(bmsAddress)) {
         Serial.println("BMS connection FAILED");
         tftLog("BMS connection FAILED. Retrying...");
         bmsConnected = false;
-        BLEDevice::startAdvertising();
+        NimBLEDevice::startAdvertising();
         return false;
     }
 
-    BLERemoteService* pService = pClient->getService(serviceUUID);
-    if (!pService) { pClient->disconnect(); bmsConnected = false; BLEDevice::startAdvertising(); return false; }
+    NimBLERemoteService* pService = pClient->getService(serviceUUID);
+    if (!pService) { pClient->disconnect(); bmsConnected = false; NimBLEDevice::startAdvertising(); return false; }
 
     pDataChar = pService->getCharacteristic(dataCharUUID);
-    if (!pDataChar) { pClient->disconnect(); bmsConnected = false; BLEDevice::startAdvertising(); return false; }
+    if (!pDataChar) { pClient->disconnect(); bmsConnected = false; NimBLEDevice::startAdvertising(); return false; }
 
     if (pDataChar->canNotify()) {
-        pDataChar->registerForNotify(notifyCallback);
+        pDataChar->subscribe(true, notifyCallback);
     }
 
     pWriteChar = pService->getCharacteristic(writeCharUUID);
@@ -882,7 +899,7 @@ bool connectBLE() {
     drawStaticUI();
 
     // Re-enable BLE Advertising so Phone can connect seamlessly concurrently with BMS Client
-    BLEDevice::startAdvertising();
+    NimBLEDevice::startAdvertising();
     Serial.println("[BLE SERVER] Sentry Offline Control advertising resumed (Dual-BLE Active).");
     return true;
 }
@@ -1112,7 +1129,7 @@ void setup() {
     Serial.println("[TFT] Display initialized.");
 
     // Initialize BLE Subsystem (Dual Server & Client)
-    BLEDevice::init("Sentry_Controller");
+    NimBLEDevice::init("Sentry_Controller");
     setupBLEServer();
     Serial.println("[BLE] BLE Server ready and advertising.");
 

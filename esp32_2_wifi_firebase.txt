@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
@@ -20,10 +21,19 @@ const int SENSOR_CH3_PIN = 34;  // ADC1_CH6 -> ACS758 Sensor 3 (CH3 Non-crit)
 // ============================================================
 // NETWORK & CLOUD CONFIGURATION
 // ============================================================
-const char* WIFI_SSID      = "Dan";
-const char* WIFI_PASSWORD  = "iveiveive";
+// Add each phone hotspot here. WiFiMulti selects the strongest available
+// configured network; leave unused slots empty.
+const char* WIFI_SSID_1      = "Dan";
+const char* WIFI_PASSWORD_1  = "iveiveive";
+const char* WIFI_SSID_2      = "Redmi 13C";
+const char* WIFI_PASSWORD_2  = "*\"':;!?@#";
+const char* WIFI_SSID_3      = "";
+const char* WIFI_PASSWORD_3  = "";
 const char* FIREBASE_HOST  = "https://fyp-inverter-monitor-default-rtdb.firebaseio.com";
 const unsigned long WIFI_TIMEOUT = 20000;
+
+WiFiMulti wifiMulti;
+bool wifiNetworksConfigured = false;
 
 // Supabase Configuration
 const char* SUPABASE_HOST    = "https://depcetmlhqtabuzhvtdf.supabase.co";
@@ -152,20 +162,35 @@ void calibrateSensors() {
 void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
 
-    Serial.print("[WiFi] Connecting to: ");
-    Serial.println(WIFI_SSID);
-
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    if (!wifiNetworksConfigured) {
+        const char* ssids[] = { WIFI_SSID_1, WIFI_SSID_2, WIFI_SSID_3 };
+        const char* passwords[] = { WIFI_PASSWORD_1, WIFI_PASSWORD_2, WIFI_PASSWORD_3 };
+        for (int i = 0; i < 3; i++) {
+            if (ssids[i][0] != '\0') {
+                wifiMulti.addAP(ssids[i], passwords[i]);
+                Serial.print("[WiFi] Configured hotspot: ");
+                Serial.println(ssids[i]);
+            }
+        }
+        wifiNetworksConfigured = true;
+    }
+
+    Serial.println("[WiFi] Searching for the strongest configured hotspot...");
 
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
-        delay(500);
+        if (wifiMulti.run(1000) == WL_CONNECTED) break;
         Serial.print(".");
     }
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println("\n[WiFi] Connected successfully!");
+        Serial.print("[WiFi] Active hotspot: ");
+        Serial.println(WiFi.SSID());
+        Serial.print("[WiFi] Signal strength: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
         Serial.print("[WiFi] IP Address: ");
         Serial.println(WiFi.localIP());
 
